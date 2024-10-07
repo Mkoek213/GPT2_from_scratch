@@ -1,4 +1,6 @@
 import math
+import numpy as np
+import torch
 
 
 def get_lr(iteration, warmup_steps, max_steps, max_lr, min_lr):
@@ -44,3 +46,10 @@ def get_lr(iteration, warmup_steps, max_steps, max_lr, min_lr):
 
     # Final learning rate is interpolated between max_lr and min_lr based on the cosine decay coefficient.
     return min_lr + coeff * (max_lr - min_lr)
+
+
+def load_tokens(filename):
+    npt = np.load(filename)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
+

@@ -1,3 +1,7 @@
+from attr import dataclass
+
+
+@dataclass
 class GPTConfig:
     """
     Configuration class for GPT (Generative Pretrained Transformer) models.

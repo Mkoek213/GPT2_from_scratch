@@ -1,5 +1,9 @@
-import torch
-import tiktoken
+import os
+
+from sympy.logic.boolalg import Boolean
+
+from gpt2_from_scratch.helper import load_tokens
+
 
 
 class DataLoaderLite:
@@ -27,7 +31,7 @@ class DataLoaderLite:
         Returns the next batch of tokenized data for this process. Resets to the beginning if the end of data is reached.
     """
 
-    def __init__(self, B, T, process_rank, num_processes):
+    def __init__(self, B, T, process_rank, num_processes, split, master_process: bool):
         """
         Initializes the DataLoaderLite object.
 
@@ -46,16 +50,28 @@ class DataLoaderLite:
         self.T = T  # Sequence length
         self.process_rank = process_rank  # Current process rank
         self.num_processes = num_processes  # Total number of processes
+        assert split in {'train', 'val'}
 
-        # Load tokens from disk and store in memory
-        with open('../input.txt', 'r') as f:
-            text = f.read()  # Read the entire text file into memory
-        enc = tiktoken.get_encoding('gpt2')  # Use GPT-2 encoding to tokenize the text
-        tokens = enc.encode(text)  # Convert text to tokens
-        self.tokens = torch.tensor(tokens)  # Convert tokens to a PyTorch tensor for easy manipulation
-        print(f"loaded {len(self.tokens)} tokens")  # Output the total number of tokens loaded
+        # get the shard filenames
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
 
-        # Set the initial position for the current process, based on the batch size, sequence length, and process rank
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank
+
+    def reset(self):
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
@@ -80,11 +96,13 @@ class DataLoaderLite:
         y = buf[1:].view(B, T)  # Targets (B, T) - all except the first token, shifted by one
 
         # Advance the current position by B * T tokens
-        self.current_position += B * T
+        self.current_position += B * T * self.num_processes
 
         # If the current position exceeds the available tokens for the current process, reset
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             # Reset the position to the start for the next epoch or when all data has been processed
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
             self.current_position = self.B * self.T * self.num_processes
 
         # Return the input and target tensors
