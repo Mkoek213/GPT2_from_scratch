@@ -10,7 +10,8 @@ from torch.distributed import init_process_group, destroy_process_group
 from gpt2_from_scratch.DataLoader import DataLoaderLite
 from gpt2_from_scratch.GPT import GPT
 from gpt2_from_scratch.GPTConfig import GPTConfig
-from gpt2_from_scratch.helper import get_lr
+from gpt2_from_scratch.hellaswag import render_example, iterate_examples
+from gpt2_from_scratch.helper import get_lr, get_most_likely_row
 
 # how to launch using ddp:
 # torchrun --standalone --nproc_per_node=1 train_gpt2.py // --nproc_per_node=1, because in my case i have only 1 GPU
@@ -63,27 +64,37 @@ if ddp and ddp_local_rank >= 1: # no case of using ddp if you have only one GPU
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp and ddp_local_rank >= 1 else model
 
-max_lr = 6e-4
+max_lr = 3 * 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 30
-max_steps = 500
+warmup_steps = 50
+max_steps = 1500
 time_limit = 8 * 60 * 60 # in seconds, 8hours
 
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f: # open so file will start empty
+    pass
+
 enc = tiktoken.get_encoding("gpt2")
 
 start_time = time.time()
+
+
+
 for step in range(max_steps):
     t0 = time.time()
+    last_step = (step == max_steps - 1)
 
     # evaluate validation loss once per 20 steps
-    if step % 20 == 0:
+    if step % 20 == 0 or last_step:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
-            val_loss_accum = 0
+            val_loss_accum = 0.0
             val_loss_steps = 4
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
@@ -95,10 +106,57 @@ for step in range(max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, "w") as f:
+                f.write(f"step {step} | validation loss: {val_loss_accum.item():.4f}\n")
+            if step > 0 and (step % 15 == 0 or last_step):
+                # write checkpoints
+                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                checkpoint = {
+                    'model_state_dict': raw_model.state_dict(),
+                    'config': raw_model.config,
+                    'step': step,
+                    'val_loss': val_loss_accum.item(),
+                    'state_dict': optimizer.state_dict()
+                }
+                torch.save(checkpoint, checkpoint_path)
+
+
+    # evaluate hellaswag once per 20 steps
+    if step % 20 == 0 or last_step:
+        num_correct_norm = 0
+        num_total = 0
+        for i, example in enumerate(iterate_examples("val")):
+            # only process examples where i % ddp_world_size == ddp_rank
+            if i % ddp_world_size != ddp_rank:
+                continue
+            # render the example
+            _, tokens, mask, label = render_example(example)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+            # get the logits
+            with torch.no_grad():
+                logits, loss = model(tokens)
+                pred_norm = get_most_likely_row(tokens, mask, logits)
+            num_total += 1
+            num_correct_norm += int(pred_norm == label)
+        # reduce stats across all processes
+        if ddp:
+            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            num_total = num_total.item()
+            num_correct_norm = num_correct_norm.item()
+        acc_norm = num_correct_norm / num_total
+        if master_process:
+            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total} = {acc_norm:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"step {step} | HellaSwag accuracy: {acc_norm:.4f}\n")
+
 
 
     # generate from the model once per 20 steps
-    if step > 0 and step % 20 == 0:
+    if (step > 0 and step % 20 == 0) or last_step:
         model.eval()
         num_return_sequences = 4
         max_length = 32
@@ -157,11 +215,13 @@ for step in range(max_steps):
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
-    dt = (t1 - t0) * 1000 # in miliseconds
+    dt = (t1 - t0) # in second
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    tokens_per_sec = (train_loader.B * train_loader.T) / dt
     if master_process:
         print(f"step {step}| loss: {loss_accum.item():.6f}| lr: {lr:.4e}| norm: {norm:.4f} | dt: {dt:.2f}ms| tok/sec: {tokens_per_sec}")
+        with open(log_file, "w") as f:
+            f.write(f"step {step} | loss: {loss_accum.item():.6f}")
     elapsed_time = time.time() - start_time
     if elapsed_time >= time_limit:
         print(f"Training stopped after {elapsed_time} seconds.")

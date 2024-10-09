@@ -12,6 +12,7 @@ transformers = "^4.45.1"
 torch = "^2.4.1"
 matplotlib = "^3.9.2"
 tiktoken = "^0.7.0"
+datasets = "^3.0.1"
 
 
 [build-system]
