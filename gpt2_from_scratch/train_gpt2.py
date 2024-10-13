@@ -68,7 +68,7 @@ max_lr = 3 * 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 50
 max_steps = 1500
-time_limit = 8 * 60 * 60 # in seconds, 8hours
+time_limit = 11 * 60 * 60 # in seconds, 11hours
 
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
@@ -106,9 +106,8 @@ for step in range(max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
-            with open(log_file, "w") as f:
+            with open(log_file, "a") as f:
                 f.write(f"step {step} | validation loss: {val_loss_accum.item():.4f}\n")
-            if step > 0 and (step % 15 == 0 or last_step):
                 # write checkpoints
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
                 checkpoint = {
@@ -220,7 +219,7 @@ for step in range(max_steps):
     tokens_per_sec = (train_loader.B * train_loader.T) / dt
     if master_process:
         print(f"step {step}| loss: {loss_accum.item():.6f}| lr: {lr:.4e}| norm: {norm:.4f} | dt: {dt:.2f}ms| tok/sec: {tokens_per_sec}")
-        with open(log_file, "w") as f:
+        with open(log_file, "a") as f:
             f.write(f"step {step} | loss: {loss_accum.item():.6f}")
     elapsed_time = time.time() - start_time
     if elapsed_time >= time_limit:
